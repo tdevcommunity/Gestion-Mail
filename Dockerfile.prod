@@ -1,0 +1,44 @@
+# Production image built from source by .github/workflows/deploy.yml.
+# (The upstream Dockerfile only packages a binary prebuilt by goreleaser.)
+
+# --- Frontend: email builder, then the admin UI (Vite) ---
+FROM node:22-bookworm AS frontend
+WORKDIR /src
+ARG LISTMONK_VERSION=v0.0.0
+COPY frontend/ frontend/
+COPY static/ static/
+RUN cd frontend/email-builder && yarn install --frozen-lockfile --network-timeout 600000 && yarn build \
+ && mkdir -p ../public/static/email-builder && cp -r dist/* ../public/static/email-builder/
+# `yarn build` would run eslint with --ignore-path .gitignore (excluded from the
+# build context), so call Vite directly.
+RUN cd frontend && yarn install --network-timeout 600000 \
+ && VUE_APP_VERSION="${LISTMONK_VERSION}" yarn vite build
+
+# --- Backend: Go binary with all static assets packed in (stuffbin) ---
+FROM golang:1.26-bookworm AS backend
+WORKDIR /src
+ARG LISTMONK_VERSION=v0.0.0
+ARG LISTMONK_COMMIT=unknown
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+COPY --from=frontend /src/frontend/dist frontend/dist
+COPY --from=frontend /src/static/public/static/altcha.umd.js static/public/static/altcha.umd.js
+RUN CGO_ENABLED=0 go build -o listmonk \
+      -ldflags="-s -w -X 'main.buildString=${LISTMONK_VERSION} (#${LISTMONK_COMMIT})' -X 'main.versionString=${LISTMONK_VERSION}'" ./cmd \
+ && go install github.com/knadh/stuffbin/...@latest \
+ && stuffbin -a stuff -in listmonk -out listmonk \
+      config.toml.sample schema.sql queries:/queries permissions.json \
+      static/public:/public static/email-templates frontend/dist:/admin i18n:/i18n
+
+# --- Runtime ---
+FROM alpine:3.22
+RUN apk --no-cache add ca-certificates tzdata shadow su-exec
+WORKDIR /listmonk
+COPY --from=backend /src/listmonk .
+COPY config.toml.sample config.toml
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+EXPOSE 9000
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["./listmonk"]
